@@ -228,7 +228,13 @@
         document.body.appendChild(player);
 
         if (CDN_MAIN_SWF !== "") {
-            player.load({ url: CDN_MAIN_SWF });
+            player.load({
+            url: CDN_MAIN_SWF,
+            parameters: {
+                 swfVer: "20111130_101735",
+                 cdnBasePath: "velvessences.github.io/MSP/Source/CDN/"
+                }
+            });
         } else {
             console.error("No CDN link provided! Please update the CDN_MAIN_SWF variable.");
             alert("Error: Main.swf path is empty. Please set your CDN link in the code.");
