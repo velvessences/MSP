@@ -24,6 +24,22 @@
         }
     </style>
 
+    <!-- 
+      FIX 1: Make ExternalInterface.call("eval", "document.location.href") work in Ruffle.
+      The SWF calls this on startup to get the page URL. Ruffle can't run eval() natively,
+      so we intercept it here. Without this, browserUrl = null and the game dies silently.
+    -->
+    <script>
+      window.eval = (function(originalEval) {
+        return function(code) {
+          if (code === "document.location.href") {
+            return window.location.href;
+          }
+          return originalEval(code);
+        };
+      })(window.eval);
+    </script>
+
     <script>
       (function () {
         var MAX_BYTES = 128 * 1024 * 1024;
@@ -219,7 +235,8 @@
 
   <body>
     <script>
-      const CDN_MAIN_SWF = "https://velvessences.github.io/MSP/Source/Main_20111130_101735.swf"; 
+      const CDN_MAIN_SWF = "https://velvessences.github.io/MSP/Source/Main_20111130_101735.swf";
+      const CDN_BASE     = "https://velvessences.github.io/MSP/Source/CDN/";
 
       window.addEventListener("DOMContentLoaded", function () {
         var ruffle = window.RufflePlayer.newest();
@@ -229,10 +246,17 @@
 
         if (CDN_MAIN_SWF !== "") {
             player.load({
-            url: CDN_MAIN_SWF,
-            parameters: {
-                 swfVer: "20111130_101735",
-                 cdnBasePath: "velvessences.github.io/MSP/Source/CDN/"
+                url: CDN_MAIN_SWF,
+                parameters: {
+                    // FIX 2: swfVer was null before — this fixes the ?v=null on resource module URLs
+                    swfVer: "20111130_101735",
+                    // FIX 3: Tell the SWF where your CDN is so it can find styles, locales, etc.
+                    cdnBasePath: CDN_BASE,
+                    // FIX 4: Trick getCurrentSiteConfig() into matching a known domain.
+                    // Your domain (github.io) is not in the SWF's hardcoded domain list,
+                    // so config returns null and the game silently dies. This makes it
+                    // think it's running on dev.moviestarplanet.com (en_US, non-production).
+                    phoneWebAppHome: "http://dev.moviestarplanet.com/"
                 }
             });
         } else {
