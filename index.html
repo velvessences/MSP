@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>My MSP Server</title>
+    
+    <style>
+      html, body {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            color: #e0e0e0;
+            font-family: monospace;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+        }
+        #player {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            background: #000;
+        }
+    </style>
+
+    <script>
+      (function () {
+        var MAX_BYTES = 128 * 1024 * 1024;
+        var DB_NAME = "swf-cache";
+        var DB_VERSION = 1;
+        var STORE = "entries";
+        var SKIP_BASENAMES = new Set(["main.swf"]);
+
+        var cache = new Map();
+        var totalBytes = 0;
+        var hits = 0;
+        var misses = 0;
+        var db = null;
+
+        function basename(pathname) {
+            var slash = pathname.lastIndexOf("/");
+            return slash >= 0 ? pathname.slice(slash + 1) : pathname;
+        }
+
+        function shouldCache(url) {
+            var u;
+            try { u = new URL(url, location.href); } catch (_) { return false; }
+            if (!u.pathname.toLowerCase().endsWith(".swf")) return false;
+            if (SKIP_BASENAMES.has(basename(u.pathname).toLowerCase())) return false;
+            return true;
+        }
+
+        function touch(url) {
+            if (!cache.has(url)) return;
+            var entry = cache.get(url);
+            cache.delete(url);
+            cache.set(url, entry);
+        }
+
+        function idbStore(mode) {
+            if (!db) return null;
+            try { return db.transaction(STORE, mode).objectStore(STORE); } catch (_) { return null; }
+        }
+
+        function idbPut(url, bytes, size) {
+            var s = idbStore("readwrite");
+            if (!s) return;
+            try { s.put({ url: url, bytes: bytes, size: size, lastAccessed: Date.now() }); } catch (_) {}
+        }
+
+        function idbDelete(url) {
+            var s = idbStore("readwrite");
+            if (!s) return;
+            try { s.delete(url); } catch (_) {}
+        }
+
+        function idbBumpAccess(url) {
+            var s = idbStore("readwrite");
+            if (!s) return;
+            try {
+                var req = s.get(url);
+                req.onsuccess = function () {
+                    var rec = req.result;
+                    if (!rec) return;
+                    rec.lastAccessed = Date.now();
+                    try { s.put(rec); } catch (_) {}
+                };
+            } catch (_) {}
+        }
+
+        function evict(neededBytes) {
+            while (totalBytes + neededBytes > MAX_BYTES && cache.size > 0) {
+                var oldestKey = cache.keys().next().value;
+                var oldest = cache.get(oldestKey);
+                cache.delete(oldestKey);
+                totalBytes -= oldest.size;
+                idbDelete(oldestKey);
+            }
+        }
+
+        function buildCachedResponse(url, entry) {
+            var resp = new Response(entry.bytes.slice(0), {
+                status: 200,
+                statusText: "OK",
+                headers: {
+                    "Content-Type": "application/x-shockwave-flash",
+                    "Content-Length": String(entry.size),
+                    "X-Ruffle-SWF-Cache": "hit"
+                }
+            });
+            try {
+                var absolute = new URL(url, location.href).href;
+                Object.defineProperty(resp, "url", { value: absolute, writable: false, configurable: true });
+            } catch (_) {}
+            return resp;
+        }
+
+        function openDb() {
+            return new Promise(function (resolve) {
+                if (!self.indexedDB) { resolve(null); return; }
+                var req;
+                try { req = self.indexedDB.open(DB_NAME, DB_VERSION); } catch (_) { resolve(null); return; }
+                req.onupgradeneeded = function () {
+                    var d = req.result;
+                    if (!d.objectStoreNames.contains(STORE)) {
+                        var os = d.createObjectStore(STORE, { keyPath: "url" });
+                        os.createIndex("byLastAccessed", "lastAccessed");
+                    }
+                };
+                req.onsuccess = function () { resolve(req.result); };
+                req.onerror = function () { resolve(null); };
+                req.onblocked = function () { resolve(null); };
+            });
+        }
+
+        function hydrate() {
+            if (!db) return;
+            var s;
+            try { s = db.transaction(STORE, "readonly").objectStore(STORE); } catch (_) { return; }
+            var idx;
+            try { idx = s.index("byLastAccessed"); } catch (_) { return; }
+            var req = idx.openCursor();
+            req.onsuccess = function () {
+                var cur = req.result;
+                if (!cur) return;
+                var rec = cur.value;
+                if (rec && rec.bytes && typeof rec.size === "number" && !cache.has(rec.url)) {
+                    if (totalBytes + rec.size <= MAX_BYTES) {
+                        cache.set(rec.url, { bytes: rec.bytes, size: rec.size });
+                        totalBytes += rec.size;
+                    }
+                }
+                cur.continue();
+            };
+        }
+
+        openDb().then(function (d) {
+            db = d;
+            hydrate();
+        });
+
+        var origFetch = window.fetch.bind(window);
+        window.fetch = function (input, init) {
+            var url = typeof input === "string" ? input : (input && input.url) ? input.url : String(input);
+            if (!shouldCache(url)) return origFetch(input, init);
+
+            var hit = cache.get(url);
+            if (hit) {
+                touch(url);
+                hits++;
+                idbBumpAccess(url);
+                return Promise.resolve(buildCachedResponse(url, hit));
+            }
+
+            misses++;
+            return origFetch(input, init).then(function (res) {
+                if (!res || !res.ok) return res;
+                var clone = res.clone();
+                clone.arrayBuffer().then(function (buf) {
+                    if (buf.byteLength === 0 || buf.byteLength > MAX_BYTES) return;
+                    evict(buf.byteLength);
+                    cache.set(url, { bytes: buf, size: buf.byteLength });
+                    totalBytes += buf.byteLength;
+                    idbPut(url, buf, buf.byteLength);
+                }).catch(function () {});
+                return res;
+            });
+        };
+      })();
+    </script>
+
+    <script>
+      window.RufflePlayer = window.RufflePlayer || {};
+      window.RufflePlayer.config = {
+          autoplay: "on",
+          unmuteOverlay: "hidden",
+          letterbox: "off",
+          scale: "showAll",
+          polyfills: false,
+          logLevel: "info",
+          allowScriptAccess: true,
+          allowNetworking: "all",
+          preferredRenderer: "wgpu-webgl",
+          splashScreen: false,
+          socketProxy: [
+              {
+                  host: "1.1.1.1",
+                  port: 1935,
+                  // NOTE: Change this later to your own Websocket proxy server URL
+                  proxyUrl: "wss://YOUR_PROXY_SERVER_HERE/"
+              }
+          ],
+          quality: "medium"
+      };
+    </script>
+    <script src="ruffle.js"></script>
+  </head>
+
+  <body>
+    <script>
+      const CDN_MAIN_SWF = "https://raw.githubusercontent.com/velvessences/MSP/refs/heads/main/Main_20111130_101735.swf"; 
+
+      window.addEventListener("DOMContentLoaded", function () {
+        var ruffle = window.RufflePlayer.newest();
+        var player = ruffle.createPlayer();
+        player.id = "player";
+        document.body.appendChild(player);
+
+        if (CDN_MAIN_SWF !== "") {
+            player.load({ url: CDN_MAIN_SWF });
+        } else {
+            console.error("No CDN link provided! Please update the CDN_MAIN_SWF variable.");
+            alert("Error: Main.swf path is empty. Please set your CDN link in the code.");
+        }
+      });
+    </script>
+  </body>
+</html>
